@@ -27,6 +27,7 @@ from collections.abc import (
 )
 from types import AsyncGeneratorType, CoroutineType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Literal,
     ParamSpec,
@@ -38,6 +39,7 @@ from typing import (
 import pluggy
 import pytest
 from _pytest.fixtures import resolve_fixture_function
+from _pytest.nodes import Node
 from _pytest.scope import Scope
 from pytest import (
     Config,
@@ -57,6 +59,14 @@ if sys.version_info >= (3, 11):
     from asyncio import Runner
 else:
     from backports.asyncio.runner import Runner
+
+if TYPE_CHECKING:
+    from pytest_asyncio.exception_config import (
+        ExceptionHandlerSettings,
+        LoopConfigSnapshot,
+        MergedExceptionHandlerConfig,
+        ScopedSettings,
+    )
 
 
 _ScopeName = Literal["session", "package", "module", "class", "function"]
@@ -303,6 +313,15 @@ def pytest_configure(config: Config) -> None:
         "mark the test as a coroutine, it will be "
         "run using an asyncio event loop",
     )
+    config.addinivalue_line(
+        "markers",
+        "asyncio_exception_config(exception_handler=None, debug=None, "
+        "slow_callback_duration=None): configure the event loop's exception "
+        "handler, debug mode and slow callback duration. Markers on outer "
+        "scopes (session, package, module, class) are merged into and "
+        "shadowed by markers on inner scopes; the loop is restored after "
+        "each test.",
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -530,6 +549,12 @@ def _apply_contextvar_changes(
 class PytestAsyncioFunction(Function):
     """Base class for all test functions managed by pytest-asyncio."""
 
+    if TYPE_CHECKING:
+        #: Merged exception configuration applied to this item, if any.
+        _merged_exception_config: MergedExceptionHandlerConfig
+        #: Immutable loop snapshot taken before the item was set up.
+        _exception_config_snapshot: LoopConfigSnapshot
+
     @classmethod
     def item_subclass_for(cls, item: Function, /) -> type[PytestAsyncioFunction] | None:
         """
@@ -579,7 +604,20 @@ class PytestAsyncioFunction(Function):
         hook_caller = self.config.hook.pytest_asyncio_loop_factories
         if hook_caller.get_hookimpls():
             _ = self._request.getfixturevalue(_asyncio_loop_factory.__name__)
-        return super().setup()
+        # Snapshot the loop and apply the merged exception configuration
+        # before any fixture runs, so that async fixtures observe it too.
+        exception_config = _begin_exception_config(self, runner_fixture_id)
+        try:
+            super().setup()
+        except BaseException:
+            if exception_config is not None:
+                # Setup failed: restore the loop immediately. Any restore
+                # error is chained onto the setup exception, so the
+                # original failure remains visible.
+                exception_config.close()
+            raise
+        if exception_config is not None:
+            self._request.addfinalizer(exception_config.close)
 
     def runtest(self) -> None:
         runner_fixture_id = f"_{self._loop_scope}_scoped_runner"
@@ -997,6 +1035,131 @@ def _validate_asyncio_marker(asyncio_marker: Mark, nodeid: str) -> None:
 
 def _get_default_test_loop_scope(config: Config) -> Any:
     return config.getini("asyncio_default_test_loop_scope")
+
+
+_EXCEPTION_CONFIG_MARKER = "asyncio_exception_config"
+_EXCEPTION_CONFIG_MARKER_FIELDS = frozenset(
+    {"exception_handler", "debug", "slow_callback_duration"}
+)
+_EXCEPTION_CONFIG_NODE_SCOPES = (
+    (pytest.Session, "session"),
+    (pytest.Package, "package"),
+    (pytest.Module, "module"),
+    (pytest.Class, "class"),
+    (pytest.Function, "function"),
+)
+
+
+def _node_scope_name(node: Node) -> str | None:
+    """Return the pytest scope name corresponding to a collector node."""
+    for node_type, scope_name in _EXCEPTION_CONFIG_NODE_SCOPES:
+        if isinstance(node, node_type):
+            return scope_name
+    return None
+
+
+def _exception_handler_settings_from_marker(
+    marker: Mark, nodeid: str
+) -> ExceptionHandlerSettings:
+    """Convert an ``asyncio_exception_config`` marker into settings."""
+    if marker.args or set(marker.kwargs) - _EXCEPTION_CONFIG_MARKER_FIELDS:
+        allowed = ", ".join(sorted(_EXCEPTION_CONFIG_MARKER_FIELDS))
+        raise pytest.UsageError(
+            f"{nodeid}: mark.{_EXCEPTION_CONFIG_MARKER} accepts only the "
+            f"keyword arguments {allowed}."
+        )
+    if not marker.kwargs:
+        raise pytest.UsageError(
+            f"{nodeid}: mark.{_EXCEPTION_CONFIG_MARKER} requires at least one "
+            "keyword argument."
+        )
+    from pytest_asyncio.exception_config import ExceptionHandlerSettings, UNSET
+
+    return ExceptionHandlerSettings(
+        exception_handler=marker.kwargs.get("exception_handler", UNSET),
+        debug=marker.kwargs.get("debug", UNSET),
+        slow_callback_duration=marker.kwargs.get("slow_callback_duration", UNSET),
+    )
+
+
+def _collect_scoped_exception_settings(
+    item: PytestAsyncioFunction,
+) -> list[ScopedSettings]:
+    """
+    Collect exception config markers from every scope layer of the item.
+
+    The returned layers follow the item's collector chain, i.e. they are
+    ordered from the outermost (session) to the innermost (function) scope.
+    """
+    from pytest_asyncio.exception_config import ScopedSettings
+
+    layers: list[ScopedSettings] = []
+    for node in item.listchain():
+        scope_name = _node_scope_name(node)
+        if scope_name is None:
+            continue
+        for marker in node.own_markers:
+            if marker.name != _EXCEPTION_CONFIG_MARKER:
+                continue
+            layers.append(
+                ScopedSettings(
+                    scope=scope_name,
+                    nodeid=node.nodeid,
+                    settings=_exception_handler_settings_from_marker(
+                        marker, node.nodeid
+                    ),
+                )
+            )
+    return layers
+
+
+class _ExceptionConfigSession:
+    """
+    Owns the snapshot/apply/restore lifecycle for one test item.
+
+    ``close`` is idempotent so that it can run both as an explicit recovery
+    step when test setup fails and as a pytest finalizer.
+    """
+
+    def __init__(
+        self, context: contextlib.AbstractContextManager[LoopConfigSnapshot]
+    ) -> None:
+        self._context = context
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._context.__exit__(*sys.exc_info())
+
+
+def _begin_exception_config(
+    item: PytestAsyncioFunction, runner_fixture_id: str
+) -> _ExceptionConfigSession | None:
+    """
+    Merge the item's config layers and apply them to its event loop.
+
+    Returns ``None`` when the item carries no exception configuration
+    marker, leaving tests without configuration completely untouched.
+    """
+    from pytest_asyncio.exception_config import (
+        ExceptionHandlerConfigMerger,
+        loop_exception_config,
+    )
+
+    layers = _collect_scoped_exception_settings(item)
+    if not layers:
+        return None
+    merged = ExceptionHandlerConfigMerger(layers).merge()
+    # Resolve the loop before the remaining fixtures are set up so that
+    # async fixtures already observe the merged configuration.
+    runner = item._request.getfixturevalue(runner_fixture_id)
+    context = loop_exception_config(runner.get_loop(), merged, item.nodeid)
+    snapshot = context.__enter__()
+    item._merged_exception_config = merged
+    item._exception_config_snapshot = snapshot
+    return _ExceptionConfigSession(context)
 
 
 _RUNNER_TEARDOWN_WARNING = """\
