@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import enum
 import functools
 import inspect
@@ -70,9 +71,35 @@ class PytestAsyncioError(Exception):
     """Base class for exceptions raised by pytest-asyncio"""
 
 
+class CoroutineWrapperError(PytestAsyncioError):
+    """Raised when a coroutine wrapper cannot be created or recorded."""
+
+
 class Mode(str, enum.Enum):
     AUTO = "auto"
     STRICT = "strict"
+
+
+#: Attribute carrying the read-only provenance chain on a generated wrapper.
+_WRAPPER_SOURCE_CHAIN_ATTR = "__pytest_asyncio_wrapper_chain__"
+
+#: Version of the coroutine-wrapper provenance format emitted by the plugin.
+COROUTINE_WRAPPER_VERSION = 1
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CoroutineWrapperSource:
+    """
+    Immutable provenance record for one coroutine-wrapper link.
+
+    Each record traces a coroutine wrapper generated or retained by the
+    plugin back to the original test node. It captures the wrapper format
+    version and the event-loop scope in which the coroutine is executed.
+    """
+
+    nodeid: str
+    wrapper_version: int
+    loop_scope: str
 
 
 hookspec = pluggy.HookspecMarker("pytest")
@@ -586,7 +613,10 @@ class PytestAsyncioFunction(Function):
         runner = self._request.getfixturevalue(runner_fixture_id)
         context = contextvars.copy_context()
         synchronized_obj = _synchronize_coroutine(
-            getattr(*self._synchronization_target_attr), runner, context
+            getattr(*self._synchronization_target_attr),
+            runner,
+            context,
+            item=self,
         )
         with MonkeyPatch.context() as c:
             c.setattr(*self._synchronization_target_attr, synchronized_obj)
@@ -621,6 +651,22 @@ class PytestAsyncioFunction(Function):
         e.g. the AsyncHypothesisTest subclass.
         """
         return self, "obj"
+
+    @functools.cached_property
+    def _wrapper_source_chain(self) -> tuple[CoroutineWrapperSource, ...]:
+        """
+        Read-only provenance chain of the coroutine wrapper for this node.
+
+        Building the chain only reads collection metadata (the node id and
+        the event-loop scope). It never invokes the wrapped test coroutine.
+        """
+        return (
+            CoroutineWrapperSource(
+                nodeid=self.nodeid,
+                wrapper_version=COROUTINE_WRAPPER_VERSION,
+                loop_scope=self._loop_scope,
+            ),
+        )
 
 
 class Coroutine(PytestAsyncioFunction):
@@ -903,17 +949,33 @@ def _synchronize_coroutine(
     func: Callable[..., CoroutineType],
     runner: asyncio.Runner,
     context: contextvars.Context,
+    *,
+    item: PytestAsyncioFunction,
 ):
     """
     Return a sync wrapper around a coroutine executing it in the
     specified runner and context.
+
+    The returned wrapper carries a read-only provenance chain linking it
+    to the original test node, the wrapper format version and the
+    event-loop scope. Objects that already carry a chain are not wrapped
+    a second time: wrapping is rejected and the original object is
+    retained unchanged. The check only inspects metadata and never
+    invokes the wrapped test coroutine.
     """
+    if get_coroutine_wrapper_chain(func):
+        raise CoroutineWrapperError(
+            f"Refusing to wrap {func!r} for {item.nodeid!r} a second time: "
+            "the object already carries a pytest-asyncio coroutine wrapper "
+            "chain. The original wrapper object is retained unchanged."
+        )
 
     @functools.wraps(func)
     def inner(*args, **kwargs):
         coro = func(*args, **kwargs)
         runner.run(coro, context=context)
 
+    setattr(inner, _WRAPPER_SOURCE_CHAIN_ATTR, item._wrapper_source_chain)
     return inner
 
 
@@ -1064,6 +1126,25 @@ def _asyncio_loop_factory(request: FixtureRequest) -> LoopFactory | None:
 def is_async_test(item: Item) -> bool:
     """Returns whether a test item is a pytest-asyncio test"""
     return isinstance(item, PytestAsyncioFunction)
+
+
+def get_coroutine_wrapper_chain(
+    obj: Any,
+) -> tuple[CoroutineWrapperSource, ...]:
+    """
+    Return the read-only coroutine-wrapper provenance chain of ``obj``.
+
+    ``obj`` may be a test item managed by pytest-asyncio or a coroutine
+    wrapper function generated or retained by the plugin. An empty tuple
+    is returned for objects that were never wrapped by the plugin.
+
+    The chain is a tuple of frozen records, so it cannot be modified in
+    place. Reading it only inspects metadata and never invokes the
+    wrapped test.
+    """
+    if isinstance(obj, PytestAsyncioFunction):
+        return obj._wrapper_source_chain
+    return tuple(getattr(obj, _WRAPPER_SOURCE_CHAIN_ATTR, ()))
 
 
 def _unused_port(socket_type: int) -> int:
