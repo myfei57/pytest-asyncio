@@ -1,0 +1,1 @@
+Added an internal ordering barrier that records asynchronous test completion events across the test, fixture-teardown and event-loop-close phases, stages out-of-order callbacks, rejects duplicate or cross-test events and publishes them in phase order without changing pytest's test outcomes

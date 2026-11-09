@@ -39,6 +39,8 @@ import pluggy
 import pytest
 from _pytest.fixtures import resolve_fixture_function
 from _pytest.scope import Scope
+
+from .completion_barrier import CompletionRegistry
 from pytest import (
     Config,
     FixtureDef,
@@ -94,6 +96,16 @@ ASYNCIO_MODE_HELP = """\
 should be tested together, e.g. \
 both pytest-asyncio and pytest-trio are used in the same project)
 """
+
+
+# One completion registry per pytest Config, keyed by id() so that no
+# undeclared attributes have to be assigned to the Config object.
+_COMPLETION_REGISTRIES: dict[int, CompletionRegistry] = {}
+
+
+def _get_completion_registry(config: Config) -> CompletionRegistry | None:
+    """Return the completion-event registry of ``config``, if initialized."""
+    return _COMPLETION_REGISTRIES.get(id(config))
 
 
 def pytest_addoption(parser: Parser, pluginmanager: PytestPluginManager) -> None:
@@ -303,6 +315,11 @@ def pytest_configure(config: Config) -> None:
         "mark the test as a coroutine, it will be "
         "run using an asyncio event loop",
     )
+    _COMPLETION_REGISTRIES[id(config)] = CompletionRegistry()
+
+
+def pytest_unconfigure(config: Config) -> None:
+    _COMPLETION_REGISTRIES.pop(id(config), None)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -584,6 +601,9 @@ class PytestAsyncioFunction(Function):
     def runtest(self) -> None:
         runner_fixture_id = f"_{self._loop_scope}_scoped_runner"
         runner = self._request.getfixturevalue(runner_fixture_id)
+        registry = _get_completion_registry(self.config)
+        if registry is not None:
+            registry.safe(functools.partial(registry.bind_runner, self.nodeid, runner))
         context = contextvars.copy_context()
         synchronized_obj = _synchronize_coroutine(
             getattr(*self._synchronization_target_attr), runner, context
@@ -899,6 +919,50 @@ def pytest_pyfunc_call(pyfuncitem: Function) -> object | None:
     return None
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(
+    item: Item, nextitem: Item | None
+) -> Generator[None, None, None]:
+    """Open a completion barrier for each async test and close it safely."""
+    registry = _get_completion_registry(item.config)
+    if registry is None or not is_async_test(item):
+        yield
+        return
+    registry.safe(functools.partial(registry.begin_test, item.nodeid))
+    try:
+        yield
+    finally:
+        # The safety net also covers skipped items and failed setups, where
+        # some milestones are never reached. It must never raise.
+        registry.safe(functools.partial(registry.finish_test, item.nodeid))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: Item) -> Generator[None, None, None]:
+    """Observe the end of the test-call phase without touching its result."""
+    registry = _get_completion_registry(item.config)
+    if registry is None or not registry.tracks(item.nodeid):
+        yield
+        return
+    try:
+        yield
+    finally:
+        registry.safe(functools.partial(registry.complete_test_phase, item.nodeid))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item: Item) -> Generator[None, None, None]:
+    """Observe the end of the fixture-teardown phase, failures included."""
+    registry = _get_completion_registry(item.config)
+    if registry is None or not registry.tracks(item.nodeid):
+        yield
+        return
+    try:
+        yield
+    finally:
+        registry.safe(functools.partial(registry.complete_teardown_phase, item.nodeid))
+
+
 def _synchronize_coroutine(
     func: Callable[..., CoroutineType],
     runner: asyncio.Runner,
@@ -1044,6 +1108,14 @@ def _create_scoped_runner_fixture(scope: _ScopeName) -> Callable:
                             RuntimeWarning,
                         )
             finally:
+                # The loop is now closed; publish the LOOP_CLOSE milestones
+                # of every test that shared this runner. Observation only:
+                # this must never mask or replace a teardown exception.
+                registry = _get_completion_registry(request.config)
+                if registry is not None:
+                    registry.safe(
+                        functools.partial(registry.complete_loop_close, runner)
+                    )
                 if _asyncio_loop_factory is not None:
                     _set_event_loop(None)
 
