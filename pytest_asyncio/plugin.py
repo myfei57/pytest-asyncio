@@ -39,6 +39,13 @@ import pluggy
 import pytest
 from _pytest.fixtures import resolve_fixture_function
 from _pytest.scope import Scope
+
+from .loop_factory_negotiation import (
+    LoopFactoryCapability,
+    LoopFactoryNegotiationError,
+    LoopFactoryNegotiator,
+    LoopFactorySnapshot,
+)
 from pytest import (
     Config,
     FixtureDef,
@@ -84,8 +91,13 @@ class PytestAsyncioSpecs:
         self,
         config: Config,
         item: Item,
-    ) -> Mapping[str, LoopFactory] | None:
+    ) -> Mapping[str, LoopFactory | LoopFactoryCapability] | None:
         raise NotImplementedError  # pragma: no cover
+
+
+#: Holds the session-wide negotiator that publishes immutable loop factory
+#: capability snapshots for the loop scope boundaries nodes enter.
+_loop_factory_negotiator_key = pytest.StashKey[LoopFactoryNegotiator]()
 
 
 ASYNCIO_MODE_HELP = """\
@@ -236,14 +248,14 @@ def _get_asyncio_debug(config: Config) -> bool:
 
 _INVALID_LOOP_FACTORIES = """\
 pytest_asyncio_loop_factories must return a non-empty mapping of \
-factory names to callables.
+factory names to callables or LoopFactoryCapability objects.
 """
 
 
 def _collect_hook_loop_factories(
     config: Config,
     item: Item,
-) -> dict[str, LoopFactory] | None:
+) -> dict[str, LoopFactory | LoopFactoryCapability] | None:
     hook_caller = item.ihook.pytest_asyncio_loop_factories
     if not hook_caller.get_hookimpls():
         return None
@@ -255,7 +267,11 @@ def _collect_hook_loop_factories(
     # original container do not affect parametrization.
     factories = dict(result)
     if not factories or any(
-        not isinstance(name, str) or not name or not callable(factory)
+        not isinstance(name, str)
+        or not name
+        or not (
+            callable(factory) or isinstance(factory, LoopFactoryCapability)
+        )
         for name, factory in factories.items()
     ):
         raise pytest.UsageError(_INVALID_LOOP_FACTORIES)
@@ -287,6 +303,7 @@ def _validate_scope(scope: str | None, option_name: str) -> None:
 
 
 def pytest_configure(config: Config) -> None:
+    config.stash[_loop_factory_negotiator_key] = LoopFactoryNegotiator()
     default_fixture_loop_scope = config.getini("asyncio_default_fixture_loop_scope")
     if default_fixture_loop_scope != _MATCH_FIXTURE_SCOPE:
         _validate_scope(
@@ -708,6 +725,32 @@ def _resolve_asyncio_marker(item: Function) -> Mark | None:
     return None
 
 
+def _scope_owner_nodeid(item: Item, loop_scope: _ScopeName) -> str:
+    """
+    Return a stable identity for the boundary that owns *loop_scope*.
+
+    Combined with the scope name, this nodeid keys capability snapshots so
+    that nodes entering the same scope boundary negotiate together while
+    different boundaries (e.g. two modules) stay independent.
+    """
+    if loop_scope == "function":
+        return item.nodeid
+    if loop_scope == "session":
+        return ""
+    owner_types = {
+        "class": pytest.Class,
+        "module": pytest.Module,
+        "package": pytest.Package,
+    }
+    owner_type = owner_types[loop_scope]
+    parent = item.parent
+    while parent is not None:
+        if isinstance(parent, owner_type):
+            return parent.nodeid
+        parent = parent.parent
+    return ""
+
+
 # The function name needs to start with "pytest_"
 # see https://github.com/pytest-dev/pytest/issues/11307
 @pytest.hookimpl(specname="pytest_pycollect_makeitem", hookwrapper=True)
@@ -774,35 +817,62 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             pytest.fail(msg, pytrace=False)
         return
 
+    default_loop_scope = _get_default_test_loop_scope(metafunc.config)
+    loop_scope = marker_loop_scope or default_loop_scope
+    # Negotiate an immutable capability snapshot for the loop scope boundary
+    # this node enters. Failed negotiations are discarded before publishing,
+    # so an effective snapshot stays usable.
+    negotiator = metafunc.config.stash[_loop_factory_negotiator_key]
+    snapshot_key = (loop_scope, _scope_owner_nodeid(metafunc.definition, loop_scope))
+    try:
+        snapshot = negotiator.negotiate(snapshot_key, [hook_factories])
+    except LoopFactoryNegotiationError as error:
+        pytest.fail(f"{nodeid}: {error}", pytrace=False)
+    debug_enabled = _get_asyncio_debug(metafunc.config)
+
+    def _factory_param(name: str) -> object:
+        capability = snapshot.factories.get(name)
+        if capability is None:
+            return pytest.param(
+                None,
+                marks=pytest.mark.skip(
+                    reason=(
+                        f"Loop factory {name!r} is not available."
+                        f" Available factories:"
+                        f" {', '.join(snapshot.names)}."
+                    ),
+                ),
+            )
+        # A node entering a scope only accepts factories whose advertised
+        # capabilities support that scope and the active debug mode.
+        if not capability.supports_scope(loop_scope):
+            reason = (
+                f"Loop factory {name!r} does not support loop scope "
+                f"{loop_scope!r}."
+            )
+        elif debug_enabled and not capability.supports_debug:
+            reason = (
+                f"Loop factory {name!r} does not support asyncio debug mode."
+            )
+        else:
+            return capability.factory
+        return pytest.param(
+            None,
+            marks=pytest.mark.skip(reason=reason),
+        )
+
     factory_params: Collection[object]
     factory_ids: Collection[str]
     if marker_selected_factory_names is None:
-        factory_params = hook_factories.values()
-        factory_ids = hook_factories.keys()
+        # Iterate in hook order to preserve the mapping's factory order.
+        factory_ids = tuple(hook_factories.keys())
+        factory_params = [_factory_param(name) for name in factory_ids]
     else:
         # Iterate in marker order to preserve explicit user selection
         # order.
         factory_ids = marker_selected_factory_names
-        factory_params = [
-            (
-                hook_factories[name]
-                if name in hook_factories
-                else pytest.param(
-                    None,
-                    marks=pytest.mark.skip(
-                        reason=(
-                            f"Loop factory {name!r} is not available."
-                            f" Available factories:"
-                            f" {', '.join(hook_factories)}."
-                        ),
-                    ),
-                )
-            )
-            for name in marker_selected_factory_names
-        ]
+        factory_params = [_factory_param(name) for name in factory_ids]
     metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
-    default_loop_scope = _get_default_test_loop_scope(metafunc.config)
-    loop_scope = marker_loop_scope or default_loop_scope
     hide_id = len(factory_ids) == 1
     metafunc.parametrize(
         _asyncio_loop_factory.__name__,

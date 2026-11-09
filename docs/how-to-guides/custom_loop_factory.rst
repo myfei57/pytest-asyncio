@@ -24,3 +24,5 @@ pytest-asyncio can run asynchronous tests with custom event loop factories by im
 The hook receives the current pytest ``item``, so it can return different factory mappings for different tests. See :doc:`configure_loop_factories_per_test` for item-based factory configuration.
 
 To run a test with only some configured factories, see :doc:`run_test_with_specific_loop_factories`.
+
+A mapping value may also be a :class:`pytest_asyncio.LoopFactoryCapability` that declares the loop scopes and debug mode supported by the factory. Capabilities are negotiated into immutable snapshots, so nodes only accept compatible factories; see :doc:`/reference/hooks` for the negotiation rules.
